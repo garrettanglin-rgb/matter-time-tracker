@@ -75,7 +75,6 @@ def _build_applescript(
     # mailboxes, then writes one record per message.
     script = textwrap.dedent(f"""\
         on extractEmail(addr)
-            -- Extract email from "Name <email>" format; return as-is if no angle brackets
             if addr contains "<" then
                 set AppleScript's text item delimiters to "<"
                 set afterBracket to text item 2 of addr
@@ -87,21 +86,13 @@ def _build_applescript(
             return addr
         end extractEmail
 
-        on isEmailInList(addr, emailList)
-            -- AppleScript string comparison is case-insensitive by default
-            set cleanAddr to my extractEmail(addr)
-            repeat with e in emailList
-                if cleanAddr is equal to (contents of e) then return true
-            end repeat
-            return false
-        end isEmailInList
-
         set fieldSep to "{field_sep}"
         set recordSep to "{record_sep}"
         set targetEmails to {{{email_list_items}}}
         set startDate to date "{start_str}"
         set endDate to date "{end_str}"
         set output to ""
+        set seenKeys to {{}}
 
         tell application "Mail"
             set boxesToSearch to {{}}
@@ -120,91 +111,151 @@ def _build_applescript(
                     end try
                 end if
             end repeat
+
             repeat with mb in boxesToSearch
+                repeat with targetEmail in targetEmails
+                    -- Search by sender containing the target email (uses Mail index)
+                    set msgs to {{}}
                     try
-                        set msgs to (every message of mb whose date received is greater than or equal to startDate and date received is less than or equal to endDate)
-                    on error
-                        set msgs to {{}}
+                        set msgs to (every message of mb whose sender contains targetEmail)
                     end try
                     repeat with msg in msgs
-                        set msgMatched to false
-                        set senderAddr to ""
                         try
-                            set senderAddr to sender of msg
-                        end try
-
-                        if my isEmailInList(senderAddr, targetEmails) then
-                            set msgMatched to true
-                        end if
-
-                        if not msgMatched then
-                            try
-                                set toRecips to every to recipient of msg
-                                repeat with r in toRecips
-                                    set rAddr to address of r
-                                    if my isEmailInList(rAddr, targetEmails) then
-                                        set msgMatched to true
-                                        exit repeat
-                                    end if
-                                end repeat
-                            end try
-                        end if
-
-                        if not msgMatched then
-                            try
-                                set ccRecips to every cc recipient of msg
-                                repeat with r in ccRecips
-                                    set rAddr to address of r
-                                    if my isEmailInList(rAddr, targetEmails) then
-                                        set msgMatched to true
-                                        exit repeat
-                                    end if
-                                end repeat
-                            end try
-                        end if
-
-                        if msgMatched then
                             set msgDate to date received of msg
-                            set msgSubject to ""
-                            set msgBody to ""
-                            set recipAddrs to ""
-                            set senderEmail to my extractEmail(senderAddr)
-                            try
-                                set msgSubject to subject of msg
-                            end try
-                            try
-                                set msgBody to content of msg
-                            end try
-                            try
-                                set toRecips to every to recipient of msg
-                                repeat with r in toRecips
-                                    if recipAddrs is not "" then set recipAddrs to recipAddrs & "; "
-                                    set recipAddrs to recipAddrs & address of r
-                                end repeat
-                            end try
-                            try
-                                set ccRecips to every cc recipient of msg
-                                repeat with r in ccRecips
-                                    if recipAddrs is not "" then set recipAddrs to recipAddrs & "; "
-                                    set recipAddrs to recipAddrs & address of r
-                                end repeat
-                            end try
+                            if msgDate is greater than or equal to startDate and msgDate is less than or equal to endDate then
+                                set senderAddr to sender of msg
+                                set senderEmail to my extractEmail(senderAddr)
+                                set msgSubject to ""
+                                try
+                                    set msgSubject to subject of msg
+                                end try
 
-                            set dateStr to (year of msgDate as text) & "-"
-                            set m to (month of msgDate as integer)
-                            if m < 10 then set dateStr to dateStr & "0"
-                            set dateStr to dateStr & (m as text) & "-"
-                            set d to (day of msgDate as integer)
-                            if d < 10 then set dateStr to dateStr & "0"
-                            set dateStr to dateStr & (d as text)
+                                -- De-duplicate
+                                set msgKey to senderEmail & msgSubject
+                                if msgKey is not in seenKeys then
+                                    set end of seenKeys to msgKey
 
-                            set wordCount to count of words of msgBody
+                                    set msgBody to ""
+                                    set recipAddrs to ""
+                                    try
+                                        set msgBody to content of msg
+                                    end try
+                                    try
+                                        set toRecips to every to recipient of msg
+                                        repeat with r in toRecips
+                                            if recipAddrs is not "" then set recipAddrs to recipAddrs & "; "
+                                            set recipAddrs to recipAddrs & address of r
+                                        end repeat
+                                    end try
+                                    try
+                                        set ccRecips to every cc recipient of msg
+                                        repeat with r in ccRecips
+                                            if recipAddrs is not "" then set recipAddrs to recipAddrs & "; "
+                                            set recipAddrs to recipAddrs & address of r
+                                        end repeat
+                                    end try
 
-                            set rec to dateStr & fieldSep & senderEmail & fieldSep & recipAddrs & fieldSep & msgSubject & fieldSep & (wordCount as text)
-                            if output is not "" then set output to output & recordSep
-                            set output to output & rec
-                        end if
+                                    set dateStr to (year of msgDate as text) & "-"
+                                    set m to (month of msgDate as integer)
+                                    if m < 10 then set dateStr to dateStr & "0"
+                                    set dateStr to dateStr & (m as text) & "-"
+                                    set d to (day of msgDate as integer)
+                                    if d < 10 then set dateStr to dateStr & "0"
+                                    set dateStr to dateStr & (d as text)
+
+                                    set wordCount to count of words of msgBody
+
+                                    set rec to dateStr & fieldSep & senderEmail & fieldSep & recipAddrs & fieldSep & msgSubject & fieldSep & (wordCount as text)
+                                    if output is not "" then set output to output & recordSep
+                                    set output to output & rec
+                                end if
+                            end if
+                        end try
                     end repeat
+
+                    -- Also search where target email is a recipient (sent emails)
+                    set msgs2 to {{}}
+                    try
+                        set msgs2 to (every message of mb whose sender contains "garrett@anglinlaw.net")
+                    end try
+                    repeat with msg in msgs2
+                        try
+                            set msgDate to date received of msg
+                            if msgDate is greater than or equal to startDate and msgDate is less than or equal to endDate then
+                                -- Check if target email is in recipients
+                                set foundRecip to false
+                                try
+                                    set toRecips to every to recipient of msg
+                                    repeat with r in toRecips
+                                        if address of r contains targetEmail then
+                                            set foundRecip to true
+                                            exit repeat
+                                        end if
+                                    end repeat
+                                end try
+                                if not foundRecip then
+                                    try
+                                        set ccRecips to every cc recipient of msg
+                                        repeat with r in ccRecips
+                                            if address of r contains targetEmail then
+                                                set foundRecip to true
+                                                exit repeat
+                                            end if
+                                        end repeat
+                                    end try
+                                end if
+
+                                if foundRecip then
+                                    set senderAddr to sender of msg
+                                    set senderEmail to my extractEmail(senderAddr)
+                                    set msgSubject to ""
+                                    try
+                                        set msgSubject to subject of msg
+                                    end try
+
+                                    set msgKey to senderEmail & msgSubject
+                                    if msgKey is not in seenKeys then
+                                        set end of seenKeys to msgKey
+
+                                        set msgBody to ""
+                                        set recipAddrs to ""
+                                        try
+                                            set msgBody to content of msg
+                                        end try
+                                        try
+                                            set toRecips to every to recipient of msg
+                                            repeat with r in toRecips
+                                                if recipAddrs is not "" then set recipAddrs to recipAddrs & "; "
+                                                set recipAddrs to recipAddrs & address of r
+                                            end repeat
+                                        end try
+                                        try
+                                            set ccRecips to every cc recipient of msg
+                                            repeat with r in ccRecips
+                                                if recipAddrs is not "" then set recipAddrs to recipAddrs & "; "
+                                                set recipAddrs to recipAddrs & address of r
+                                            end repeat
+                                        end try
+
+                                        set dateStr to (year of msgDate as text) & "-"
+                                        set m to (month of msgDate as integer)
+                                        if m < 10 then set dateStr to dateStr & "0"
+                                        set dateStr to dateStr & (m as text) & "-"
+                                        set d to (day of msgDate as integer)
+                                        if d < 10 then set dateStr to dateStr & "0"
+                                        set dateStr to dateStr & (d as text)
+
+                                        set wordCount to count of words of msgBody
+
+                                        set rec to dateStr & fieldSep & senderEmail & fieldSep & recipAddrs & fieldSep & msgSubject & fieldSep & (wordCount as text)
+                                        if output is not "" then set output to output & recordSep
+                                        set output to output & rec
+                                    end if
+                                end if
+                            end if
+                        end try
+                    end repeat
+                end repeat
             end repeat
         end tell
 
