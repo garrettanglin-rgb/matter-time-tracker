@@ -86,6 +86,7 @@ def run_report(
     output_file: str | None,
     backend: str,
     classify: bool,
+    review: bool,
     output_dir: Path | None,
 ) -> None:
     """Full pipeline: calendar + email ingestion, optional AI classify, report."""
@@ -98,8 +99,10 @@ def run_report(
     end_date = datetime.strptime(end, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
     out = output_dir or get_output_dir()
 
+    step_total = 5 if review else 4
+
     # ---- Calendar events ----
-    print(f"[1/4] Reading calendar events from {start} to {end} ...")
+    print(f"[1/{step_total}] Reading calendar events from {start} to {end} ...")
     try:
         events = read_events(start_date, end_date, backend=backend)
     except Exception as exc:
@@ -125,7 +128,7 @@ def run_report(
         print("  No calendar events found.")
 
     # ---- Emails ----
-    print(f"\n[2/4] Querying Apple Mail for emails from {start} to {end} ...")
+    print(f"\n[2/{step_total}] Querying Apple Mail for emails from {start} to {end} ...")
     try:
         matched_emails, unmatched_emails = read_emails(start_date, end_date)
     except Exception as exc:
@@ -150,7 +153,7 @@ def run_report(
         print("  No matching emails found.")
 
     # ---- Merge ----
-    print("\n[3/4] Merging entries and grouping by matter ...")
+    print(f"\n[3/{step_total}] Merging entries and grouping by matter ...")
     entries = merge_entries(
         matched_events=matched_events if not matched_events.empty else None,
         matched_emails=matched_emails if not matched_emails.empty else None,
@@ -163,8 +166,20 @@ def run_report(
     print(f"  {len(entries)} total time entries across "
           f"{entries['matter_id'].nunique()} matter(s).")
 
+    # ---- Interactive review (optional) ----
+    if review:
+        from matter_time_tracker.reviewer import review_entries
+
+        print(f"\n[4/{step_total}] Interactive review ...")
+        entries = review_entries(entries, out, start, end)
+
+        if entries.empty:
+            print("All entries were excluded. Nothing to report.")
+            return
+
     # ---- Generate reports ----
-    print("\n[4/4] Generating reports ...")
+    report_step = 5 if review else 4
+    print(f"\n[{report_step}/{step_total}] Generating reports ...")
     basename = output_file or f"time_report_{start}_to_{end}"
     # Strip extension if user provided one — we generate both .xlsx and .txt
     basename = basename.removesuffix(".xlsx").removesuffix(".txt")
@@ -347,6 +362,12 @@ def main(argv: list[str] | None = None) -> None:
         help="Use the Anthropic API to classify unmatched items (uses API credits)",
     )
     report_parser.add_argument(
+        "--review",
+        action="store_true",
+        default=False,
+        help="Interactively review each entry before generating the report",
+    )
+    report_parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
@@ -367,7 +388,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "report":
         run_report(
             args.start, args.end, args.output, args.backend,
-            args.classify, args.output_dir,
+            args.classify, args.review, args.output_dir,
         )
     else:
         parser.print_help()
