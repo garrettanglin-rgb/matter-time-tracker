@@ -195,11 +195,21 @@ def run_report(
 
     # Quick summary to terminal
     grand_total = entries["hours"].sum()
-    print(f"\n--- Report summary ---")
+    print(f"\n--- Itemized Time Entries ---")
     for mid in entries["matter_id"].unique():
         sub = entries[entries["matter_id"] == mid]
-        print(f"  [{mid}] {sub.iloc[0]['matter_name']}: {sub['hours'].sum():.1f}h")
-    print(f"  Grand total: {grand_total:.1f}h")
+        matter_name = sub.iloc[0]["matter_name"]
+        client_name = sub.iloc[0]["client_name"]
+        matter_total = sub["hours"].sum()
+        print(f"\n  [{mid}] {matter_name}")
+        print(f"  Client: {client_name}")
+        print(f"  {'-' * 68}")
+        for _, erow in sub.iterrows():
+            hrs = f"{erow['hours']:.1f}h"
+            print(f"    {erow['date']}  {erow['activity_description']:<50s}  {hrs:>5s}")
+        print(f"  {'':>54s}  Subtotal: {matter_total:.1f}h")
+    print(f"\n  {'=' * 68}")
+    print(f"  {'':>54s}  GRAND TOTAL: {grand_total:.1f}h")
 
 
 def run_events(
