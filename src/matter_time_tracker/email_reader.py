@@ -93,15 +93,18 @@ def _build_applescript(
             set boxesToSearch to {{}}
             set allAccounts to every account
             repeat with acct in allAccounts
+                set acctAddr to ""
                 try
-                    set end of boxesToSearch to inbox of acct
+                    set acctAddr to email addresses of acct as text
                 end try
-                try
-                    set end of boxesToSearch to sent mailbox of acct
-                end try
-                try
-                    set end of boxesToSearch to drafts mailbox of acct
-                end try
+                if acctAddr contains "garrett@anglinlaw.net" then
+                    try
+                        set end of boxesToSearch to inbox of acct
+                    end try
+                    try
+                        set end of boxesToSearch to sent mailbox of acct
+                    end try
+                end if
             end repeat
             repeat with mb in boxesToSearch
                     try
