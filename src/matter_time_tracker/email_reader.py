@@ -95,7 +95,7 @@ def _build_applescript(
                 set allBoxes to every mailbox of acct
                 repeat with mb in allBoxes
                     try
-                        set msgs to (every message of mb whose date received ≥ startDate and date received ≤ endDate)
+                        set msgs to (every message of mb whose date received is greater than or equal to startDate and date received is less than or equal to endDate)
                     on error
                         set msgs to {{}}
                     end try
@@ -112,8 +112,21 @@ def _build_applescript(
 
                         if not msgMatched then
                             try
-                                set recipList to recipients of msg
-                                repeat with r in recipList
+                                set toRecips to every to recipient of msg
+                                repeat with r in toRecips
+                                    set rAddr to address of r
+                                    if my isEmailInList(rAddr, targetEmails) then
+                                        set msgMatched to true
+                                        exit repeat
+                                    end if
+                                end repeat
+                            end try
+                        end if
+
+                        if not msgMatched then
+                            try
+                                set ccRecips to every cc recipient of msg
+                                repeat with r in ccRecips
                                     set rAddr to address of r
                                     if my isEmailInList(rAddr, targetEmails) then
                                         set msgMatched to true
@@ -135,9 +148,15 @@ def _build_applescript(
                                 set msgBody to content of msg
                             end try
                             try
-                                set recipList to recipients of msg
-                                set recipAddrs to ""
-                                repeat with r in recipList
+                                set toRecips to every to recipient of msg
+                                repeat with r in toRecips
+                                    if recipAddrs is not "" then set recipAddrs to recipAddrs & "; "
+                                    set recipAddrs to recipAddrs & address of r
+                                end repeat
+                            end try
+                            try
+                                set ccRecips to every cc recipient of msg
+                                repeat with r in ccRecips
                                     if recipAddrs is not "" then set recipAddrs to recipAddrs & "; "
                                     set recipAddrs to recipAddrs & address of r
                                 end repeat
