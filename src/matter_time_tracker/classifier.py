@@ -59,6 +59,31 @@ directly relevant subject matter).
 - Prefer returning null over a low-confidence guess.
 """
 
+_BATCH_SYSTEM_PROMPT = """\
+You are a legal matter classification assistant.  You will be given a batch of \
+items from a lawyer's calendar or inbox along with a list of active legal matters. \
+Your job is to determine which matter each item most likely relates to.
+
+Respond with ONLY a JSON array (no markdown fences, no commentary). Each element \
+must be a JSON object with an "item_index" field (0-based) matching the item number:
+
+[
+  {"item_index": 0, "matter_id": "<id or null>", "confidence": "high|medium|low", "reason": "<brief>"},
+  {"item_index": 1, "matter_id": null, "confidence": "high", "reason": "<brief>"},
+  ...
+]
+
+Rules:
+- Use "high" confidence when the connection is obvious (names, case numbers, \
+directly relevant subject matter).
+- Use "medium" when the connection is plausible but circumstantial.
+- Use "low" when you are guessing based on limited signals.
+- Prefer returning null over a low-confidence guess.
+- You MUST return one result per item, in order.
+"""
+
+_BATCH_SIZE = 10
+
 
 def _format_matters_context(matters: list[Matter]) -> str:
     lines = ["Active matters:"]
@@ -149,6 +174,55 @@ def _classify_single(
     )
 
 
+def _classify_batch(
+    client: anthropic.Anthropic,
+    matters_context: str,
+    items: list[str],
+    model: str,
+) -> list[ClassificationResult]:
+    """Send a batch of items to Claude and parse results for all of them."""
+    numbered_items = []
+    for i, item_text in enumerate(items):
+        numbered_items.append(f"--- Item {i} ---\n{item_text}")
+    all_items_text = "\n\n".join(numbered_items)
+
+    user_message = f"{matters_context}\n\n---\n\nItems to classify:\n\n{all_items_text}"
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=1024,
+        system=_BATCH_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_message}],
+    )
+
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        raw = raw.strip()
+
+    try:
+        data_list = json.loads(raw)
+    except json.JSONDecodeError:
+        return [ClassificationResult(matter_id=None, confidence="high", reason="Parse error")] * len(items)
+
+    if not isinstance(data_list, list):
+        return [ClassificationResult(matter_id=None, confidence="high", reason="Parse error")] * len(items)
+
+    results = [ClassificationResult(matter_id=None, confidence="high", reason="No response")] * len(items)
+    for entry in data_list:
+        idx = entry.get("item_index", -1)
+        if 0 <= idx < len(items):
+            results[idx] = ClassificationResult(
+                matter_id=entry.get("matter_id"),
+                confidence=entry.get("confidence", "low"),
+                reason=entry.get("reason", ""),
+            )
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Public API — classify unmatched events
 # ---------------------------------------------------------------------------
@@ -183,24 +257,35 @@ def classify_unmatched_events(
     ai_matched_rows: list[dict] = []
     still_unmatched_rows: list[dict] = []
 
-    for _, row in unmatched.iterrows():
-        row_dict = row.to_dict()
-        item_text = _format_event_item(row_dict)
-        result = _classify_single(client, matters_context, item_text, model)
+    all_rows = [row.to_dict() for _, row in unmatched.iterrows()]
+    total = len(all_rows)
 
-        if result.matter_id and result.confidence in ("high", "medium"):
-            matter = find_matter_by_id(result.matter_id, matters)
-            if matter:
-                row_dict["matter_id"] = matter.matter_id
-                row_dict["matter_name"] = matter.matter_name
-                row_dict["client_name"] = matter.client_name
-                row_dict["match_type"] = (
-                    f"ai_classified ({result.confidence}: {result.reason})"
-                )
-                ai_matched_rows.append(row_dict)
-                continue
+    for batch_start in range(0, total, _BATCH_SIZE):
+        batch_rows = all_rows[batch_start:batch_start + _BATCH_SIZE]
+        batch_end = min(batch_start + len(batch_rows), total)
+        print(f"    Classifying events {batch_start + 1}-{batch_end} of {total} ...", flush=True)
 
-        still_unmatched_rows.append(row_dict)
+        item_texts = [_format_event_item(r) for r in batch_rows]
+
+        try:
+            results = _classify_batch(client, matters_context, item_texts, model)
+        except Exception:
+            results = [ClassificationResult(matter_id=None, confidence="high", reason="API error")] * len(batch_rows)
+
+        for row_dict, result in zip(batch_rows, results):
+            if result.matter_id and result.confidence in ("high", "medium"):
+                matter = find_matter_by_id(result.matter_id, matters)
+                if matter:
+                    row_dict["matter_id"] = matter.matter_id
+                    row_dict["matter_name"] = matter.matter_name
+                    row_dict["client_name"] = matter.client_name
+                    row_dict["match_type"] = (
+                        f"ai_classified ({result.confidence}: {result.reason})"
+                    )
+                    ai_matched_rows.append(row_dict)
+                    continue
+
+            still_unmatched_rows.append(row_dict)
 
     matched_cols = list(unmatched.columns) + [
         "matter_id", "matter_name", "client_name", "match_type",
@@ -244,39 +329,50 @@ def classify_unmatched_emails(
     ai_matched_rows: list[dict] = []
     still_unmatched_rows: list[dict] = []
 
-    for _, row in unmatched.iterrows():
-        row_dict = row.to_dict()
-        item_text = _format_email_item(row_dict)
-        result = _classify_single(client, matters_context, item_text, model)
+    all_rows = [row.to_dict() for _, row in unmatched.iterrows()]
+    total = len(all_rows)
 
-        if result.matter_id and result.confidence in ("high", "medium"):
-            matter = find_matter_by_id(result.matter_id, matters)
-            if matter:
-                contact = _pick_email_contact(row_dict, matter)
-                subject = row_dict.get("subject", "") or "(no subject)"
-                ai_matched_rows.append({
-                    "date": row_dict.get("date", ""),
-                    "matter_id": matter.matter_id,
-                    "matter_name": matter.matter_name,
-                    "client_name": matter.client_name,
-                    "sender": row_dict.get("sender", ""),
-                    "recipients": row_dict.get("recipients", ""),
-                    "subject": subject,
-                    "word_count": row_dict.get("word_count", 0),
-                    "estimated_hours": row_dict.get(
-                        "estimated_hours",
-                        estimate_email_time(row_dict.get("word_count", 0)),
-                    ),
-                    "activity_description": (
-                        f"Email correspondence with {contact} re: {subject}"
-                    ),
-                    "match_type": (
-                        f"ai_classified ({result.confidence}: {result.reason})"
-                    ),
-                })
-                continue
+    for batch_start in range(0, total, _BATCH_SIZE):
+        batch_rows = all_rows[batch_start:batch_start + _BATCH_SIZE]
+        batch_end = min(batch_start + len(batch_rows), total)
+        print(f"    Classifying emails {batch_start + 1}-{batch_end} of {total} ...", flush=True)
 
-        still_unmatched_rows.append(row_dict)
+        item_texts = [_format_email_item(r) for r in batch_rows]
+
+        try:
+            results = _classify_batch(client, matters_context, item_texts, model)
+        except Exception:
+            results = [ClassificationResult(matter_id=None, confidence="high", reason="API error")] * len(batch_rows)
+
+        for row_dict, result in zip(batch_rows, results):
+            if result.matter_id and result.confidence in ("high", "medium"):
+                matter = find_matter_by_id(result.matter_id, matters)
+                if matter:
+                    contact = _pick_email_contact(row_dict, matter)
+                    subject = row_dict.get("subject", "") or "(no subject)"
+                    ai_matched_rows.append({
+                        "date": row_dict.get("date", ""),
+                        "matter_id": matter.matter_id,
+                        "matter_name": matter.matter_name,
+                        "client_name": matter.client_name,
+                        "sender": row_dict.get("sender", ""),
+                        "recipients": row_dict.get("recipients", ""),
+                        "subject": subject,
+                        "word_count": row_dict.get("word_count", 0),
+                        "estimated_hours": row_dict.get(
+                            "estimated_hours",
+                            estimate_email_time(row_dict.get("word_count", 0)),
+                        ),
+                        "activity_description": (
+                            f"Email correspondence with {contact} re: {subject}"
+                        ),
+                        "match_type": (
+                            f"ai_classified ({result.confidence}: {result.reason})"
+                        ),
+                    })
+                    continue
+
+            still_unmatched_rows.append(row_dict)
 
     ai_matched = pd.DataFrame(ai_matched_rows, columns=EMAIL_COLUMNS)
     still_unmatched = pd.DataFrame(
