@@ -2,6 +2,26 @@
   "matters": [
     {
       "matter_id": "MAT-2025-001",
+      "matter_name": "Lee Evans — 3618 Blackman Road",
+      "client_name": "Lee Evans",
+      "contact_emails": [
+        "kitandbath81@gmail.com",
+        "jddewaal@bellsouth.net",
+        "davis@parks360development.com",
+        "rob@ashworthfirm.com"
+      ],
+      "subject_keywords": [
+        "3618 Blackman Road",
+        "Blackman Road",
+        "Murfreesboro",
+        "Smith Farms",
+        "Evans Property",
+        "Parks 360",
+        "parks360"
+      ]
+    },
+    {
+      "matter_id": "MAT-2025-100",
       "matter_name": "Acme Corp v. Widget Industries — Patent Dispute",
       "client_name": "Acme Corporation",
       "contact_emails": [
@@ -12,11 +32,11 @@
         "acme patent",
         "widget industries",
         "patent dispute",
-        "MAT-2025-001"
+        "MAT-2025-100"
       ]
     },
     {
-      "matter_id": "MAT-2025-002",
+      "matter_id": "MAT-2025-101",
       "matter_name": "Baker Estate — Trust Administration",
       "client_name": "Baker Family Trust",
       "contact_emails": [
@@ -28,7 +48,7 @@
         "baker estate",
         "baker trust",
         "trust administration",
-        "MAT-2025-002"
+        "MAT-2025-101"
       ]
     }
   ]
