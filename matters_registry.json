@@ -1,0 +1,35 @@
+{
+  "matters": [
+    {
+      "matter_id": "MAT-2025-001",
+      "matter_name": "Acme Corp v. Widget Industries — Patent Dispute",
+      "client_name": "Acme Corporation",
+      "contact_emails": [
+        "jane.doe@acmecorp.com",
+        "legal@acmecorp.com"
+      ],
+      "subject_keywords": [
+        "acme patent",
+        "widget industries",
+        "patent dispute",
+        "MAT-2025-001"
+      ]
+    },
+    {
+      "matter_id": "MAT-2025-002",
+      "matter_name": "Baker Estate — Trust Administration",
+      "client_name": "Baker Family Trust",
+      "contact_emails": [
+        "robert.baker@email.com",
+        "sarah.baker@email.com",
+        "trustee@bakerfamilytrust.org"
+      ],
+      "subject_keywords": [
+        "baker estate",
+        "baker trust",
+        "trust administration",
+        "MAT-2025-002"
+      ]
+    }
+  ]
+}

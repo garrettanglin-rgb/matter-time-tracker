@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "matter-time-tracker"
+version = "0.1.0"
+description = "Local macOS tool for tracking time spent on legal matters"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.1.0",
+    "python-dotenv>=1.0.0",
+    "openpyxl>=3.1.0",
+    "anthropic>=0.39.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+matter-tracker = "matter_time_tracker.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
