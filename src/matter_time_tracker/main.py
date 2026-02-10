@@ -27,6 +27,47 @@ def list_matters() -> None:
         print()
 
 
+def run_emails(start: str, end: str, output_dir: Path | None) -> None:
+    """Read emails from Apple Mail, match to matters, and write CSV files."""
+    from matter_time_tracker.email_reader import read_emails
+
+    start_date = datetime.strptime(start, "%Y-%m-%d")
+    end_date = datetime.strptime(end, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+
+    print(f"Querying Apple Mail for emails from {start} to {end} ...")
+    matched, unmatched = read_emails(start_date, end_date)
+
+    total = len(matched) + len(unmatched)
+    if total == 0:
+        print("No matching emails found in the specified date range.")
+        return
+
+    print(f"Found {total} email(s): {len(matched)} matched, {len(unmatched)} unmatched.")
+
+    out = output_dir or get_output_dir()
+    matched_path = out / f"matched_emails_{start}_to_{end}.csv"
+    unmatched_path = out / f"unmatched_emails_{start}_to_{end}.csv"
+
+    matched.to_csv(matched_path, index=False)
+    unmatched.to_csv(unmatched_path, index=False)
+
+    print(f"\nMatched:   {len(matched)} email(s) → {matched_path}")
+    print(f"Unmatched: {len(unmatched)} email(s) → {unmatched_path}")
+
+    if not matched.empty:
+        print("\n--- Matched emails summary ---")
+        for matter_id in matched["matter_id"].unique():
+            subset = matched[matched["matter_id"] == matter_id]
+            total_hrs = subset["estimated_hours"].sum()
+            print(f"  [{matter_id}] {subset.iloc[0]['matter_name']}")
+            print(f"    {len(subset)} email(s), {total_hrs:.1f} estimated hours")
+
+    if not unmatched.empty:
+        print(f"\n--- {len(unmatched)} unmatched email(s) ---")
+        for _, row in unmatched.iterrows():
+            print(f"  {row['date']}  {row['sender']}  \"{row['subject']}\"  ({row['word_count']}w)")
+
+
 def run_events(start: str, end: str, backend: str, output_dir: Path | None) -> None:
     """Read calendar events, match to matters, and write CSV files."""
     from matter_time_tracker.calendar_reader import read_events
@@ -108,6 +149,27 @@ def main(argv: list[str] | None = None) -> None:
         help="Directory for CSV output (defaults to OUTPUT_DIR or ./output)",
     )
 
+    emails_parser = subparsers.add_parser(
+        "emails",
+        help="Read emails from Apple Mail, match to matters, and export to CSV",
+    )
+    emails_parser.add_argument(
+        "--start",
+        required=True,
+        help="Start date (inclusive), format YYYY-MM-DD",
+    )
+    emails_parser.add_argument(
+        "--end",
+        required=True,
+        help="End date (inclusive), format YYYY-MM-DD",
+    )
+    emails_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for CSV output (defaults to OUTPUT_DIR or ./output)",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "list":
@@ -117,6 +179,8 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Output directory:  {get_output_dir()}")
     elif args.command == "events":
         run_events(args.start, args.end, args.backend, args.output_dir)
+    elif args.command == "emails":
+        run_emails(args.start, args.end, args.output_dir)
     else:
         parser.print_help()
         sys.exit(0)
