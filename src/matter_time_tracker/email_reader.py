@@ -90,10 +90,20 @@ def _build_applescript(
         set output to ""
 
         tell application "Mail"
+            set boxesToSearch to {{}}
             set allAccounts to every account
             repeat with acct in allAccounts
-                set allBoxes to every mailbox of acct
-                repeat with mb in allBoxes
+                try
+                    set end of boxesToSearch to inbox of acct
+                end try
+                try
+                    set end of boxesToSearch to sent mailbox of acct
+                end try
+                try
+                    set end of boxesToSearch to drafts mailbox of acct
+                end try
+            end repeat
+            repeat with mb in boxesToSearch
                     try
                         set msgs to (every message of mb whose date received is greater than or equal to startDate and date received is less than or equal to endDate)
                     on error
@@ -177,7 +187,6 @@ def _build_applescript(
                             set output to output & rec
                         end if
                     end repeat
-                end repeat
             end repeat
         end tell
 
@@ -197,7 +206,7 @@ def _run_applescript(script: str) -> str:
         ["osascript", "-e", script],
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=600,
     )
     if result.returncode != 0:
         raise RuntimeError(
