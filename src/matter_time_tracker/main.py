@@ -5,6 +5,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
+
 from matter_time_tracker.config import get_matters_registry_path, get_output_dir
 from matter_time_tracker.registry import load_matters
 
@@ -27,7 +29,7 @@ def list_matters() -> None:
         print()
 
 
-def run_emails(start: str, end: str, output_dir: Path | None) -> None:
+def run_emails(start: str, end: str, output_dir: Path | None, classify: bool = False) -> None:
     """Read emails from Apple Mail, match to matters, and write CSV files."""
     from matter_time_tracker.email_reader import read_emails
 
@@ -42,7 +44,17 @@ def run_emails(start: str, end: str, output_dir: Path | None) -> None:
         print("No matching emails found in the specified date range.")
         return
 
-    print(f"Found {total} email(s): {len(matched)} matched, {len(unmatched)} unmatched.")
+    print(f"Found {total} email(s): {len(matched)} rules-matched, {len(unmatched)} unmatched.")
+
+    if classify and not unmatched.empty:
+        from matter_time_tracker.classifier import classify_unmatched_emails
+
+        print(f"\nClassifying {len(unmatched)} unmatched email(s) via Anthropic API ...")
+        ai_matched, unmatched = classify_unmatched_emails(unmatched)
+        if not ai_matched.empty:
+            matched = pd.concat([matched, ai_matched], ignore_index=True)
+            print(f"  AI classified: {len(ai_matched)} email(s) matched, "
+                  f"{len(unmatched)} still unmatched.")
 
     out = output_dir or get_output_dir()
     matched_path = out / f"matched_emails_{start}_to_{end}.csv"
@@ -68,7 +80,9 @@ def run_emails(start: str, end: str, output_dir: Path | None) -> None:
             print(f"  {row['date']}  {row['sender']}  \"{row['subject']}\"  ({row['word_count']}w)")
 
 
-def run_events(start: str, end: str, backend: str, output_dir: Path | None) -> None:
+def run_events(
+    start: str, end: str, backend: str, output_dir: Path | None, classify: bool = False,
+) -> None:
     """Read calendar events, match to matters, and write CSV files."""
     from matter_time_tracker.calendar_reader import read_events
     from matter_time_tracker.matcher import match_events
@@ -86,6 +100,18 @@ def run_events(start: str, end: str, backend: str, output_dir: Path | None) -> N
 
     print(f"Found {len(events)} event(s). Matching against matters registry ...")
     matched, unmatched = match_events(events)
+
+    print(f"Rules-matched: {len(matched)}, unmatched: {len(unmatched)}.")
+
+    if classify and not unmatched.empty:
+        from matter_time_tracker.classifier import classify_unmatched_events
+
+        print(f"\nClassifying {len(unmatched)} unmatched event(s) via Anthropic API ...")
+        ai_matched, unmatched = classify_unmatched_events(unmatched)
+        if not ai_matched.empty:
+            matched = pd.concat([matched, ai_matched], ignore_index=True)
+            print(f"  AI classified: {len(ai_matched)} event(s) matched, "
+                  f"{len(unmatched)} still unmatched.")
 
     out = output_dir or get_output_dir()
     matched_path = out / f"matched_events_{start}_to_{end}.csv"
@@ -148,6 +174,12 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="Directory for CSV output (defaults to OUTPUT_DIR or ./output)",
     )
+    events_parser.add_argument(
+        "--classify",
+        action="store_true",
+        default=False,
+        help="Use the Anthropic API to classify unmatched events (uses API credits)",
+    )
 
     emails_parser = subparsers.add_parser(
         "emails",
@@ -169,6 +201,12 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="Directory for CSV output (defaults to OUTPUT_DIR or ./output)",
     )
+    emails_parser.add_argument(
+        "--classify",
+        action="store_true",
+        default=False,
+        help="Use the Anthropic API to classify unmatched emails (uses API credits)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -178,9 +216,9 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Matters registry: {get_matters_registry_path()}")
         print(f"Output directory:  {get_output_dir()}")
     elif args.command == "events":
-        run_events(args.start, args.end, args.backend, args.output_dir)
+        run_events(args.start, args.end, args.backend, args.output_dir, args.classify)
     elif args.command == "emails":
-        run_emails(args.start, args.end, args.output_dir)
+        run_emails(args.start, args.end, args.output_dir, args.classify)
     else:
         parser.print_help()
         sys.exit(0)
