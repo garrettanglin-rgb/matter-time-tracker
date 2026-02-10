@@ -1,17 +1,17 @@
-"""Retrieve emails from Apple Mail on macOS via AppleScript.
+"""Retrieve emails from Apple Mail on macOS.
 
-Uses ``osascript`` (subprocess) to query Apple Mail for messages in a date
-range whose sender or any recipient matches a contact email in the matters
-registry.  Each email is matched to a matter, assigned an estimated time
-based on word-count thresholds, and returned in a pandas DataFrame ready
-for time-tracking export.
+Primary approach: Spotlight (mdfind) to find matching .emlx files, then
+parse them with Python's email module.  This is dramatically faster than
+AppleScript for large Exchange mailboxes because it uses macOS's pre-built
+search index.
 """
 
 from __future__ import annotations
 
+import email as email_lib
 import subprocess
-import textwrap
 from datetime import datetime
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from pathlib import Path
 
 import pandas as pd
@@ -22,11 +22,6 @@ from matter_time_tracker.registry import Matter, load_matters
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-# Delimiter used between fields inside a single message record.
-_FIELD_SEP = "|||"
-# Delimiter used between message records.
-_RECORD_SEP = "<<<RECORD>>>"
 
 EMAIL_COLUMNS = [
     "date",
@@ -42,285 +37,181 @@ EMAIL_COLUMNS = [
     "match_type",
 ]
 
-# ---------------------------------------------------------------------------
-# AppleScript generation
-# ---------------------------------------------------------------------------
+_MAIL_DIR = Path.home() / "Library" / "Mail"
 
 
-def _build_applescript(
+# ---------------------------------------------------------------------------
+# Spotlight (mdfind) search
+# ---------------------------------------------------------------------------
+
+def _mdfind(query: str) -> list[str]:
+    """Run mdfind and return matching file paths."""
+    try:
+        result = subprocess.run(
+            ["mdfind", "-onlyin", str(_MAIL_DIR), query],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return []
+        return [p for p in result.stdout.strip().split("\n") if p]
+    except Exception:
+        return []
+
+
+def _parse_emlx(file_path: str) -> dict | None:
+    """Parse an .emlx file and return a dict with email fields."""
+    try:
+        with open(file_path, "rb") as f:
+            first_line = f.readline()
+            # .emlx files start with a byte count of the RFC822 message
+            try:
+                byte_count = int(first_line.strip())
+                raw_msg = f.read(byte_count)
+            except ValueError:
+                # Not a standard .emlx — try reading as plain message
+                f.seek(0)
+                raw_msg = f.read()
+
+        msg = email_lib.message_from_bytes(raw_msg)
+
+        # Sender
+        from_header = msg.get("From", "")
+        _, sender_email = parseaddr(from_header)
+        if not sender_email:
+            sender_email = from_header
+
+        # Date
+        date_header = msg.get("Date", "")
+        try:
+            msg_date = parsedate_to_datetime(date_header)
+        except Exception:
+            return None
+
+        # Subject
+        subject = msg.get("Subject", "") or ""
+        # Decode if it's an encoded header
+        from email.header import decode_header
+        decoded_parts = decode_header(subject)
+        subject = ""
+        for part, charset in decoded_parts:
+            if isinstance(part, bytes):
+                subject += part.decode(charset or "utf-8", errors="replace")
+            else:
+                subject += part
+
+        # Recipients
+        to_header = msg.get("To", "") or ""
+        cc_header = msg.get("Cc", "") or ""
+        all_recips = getaddresses([to_header, cc_header])
+        recip_emails = [addr for _, addr in all_recips if addr]
+
+        # Body / word count
+        body = ""
+        try:
+            if msg.is_multipart():
+                for part in msg.walk():
+                    ct = part.get_content_type()
+                    if ct == "text/plain":
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = payload.decode("utf-8", errors="replace")
+                            break
+                # If no text/plain, try text/html
+                if not body:
+                    for part in msg.walk():
+                        ct = part.get_content_type()
+                        if ct == "text/html":
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                body = payload.decode("utf-8", errors="replace")
+                                break
+            else:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    body = payload.decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+
+        word_count = len(body.split()) if body else 0
+
+        return {
+            "date": msg_date.strftime("%Y-%m-%d"),
+            "datetime": msg_date,
+            "sender": sender_email.strip(),
+            "recipients": "; ".join(recip_emails),
+            "subject": subject.strip(),
+            "word_count": word_count,
+        }
+    except Exception:
+        return None
+
+
+def _search_spotlight(
     start_date: datetime,
     end_date: datetime,
     contact_emails: list[str],
-) -> str:
-    """Return an AppleScript that queries Apple Mail for matching messages.
+) -> list[dict]:
+    """Find matching emails using Spotlight (mdfind) + .emlx parsing.
 
-    The script iterates over every account / mailbox and collects messages
-    whose date falls within the range **and** whose sender or any recipient
-    matches one of *contact_emails*.
+    Searches for emails FROM each contact and emails TO each contact
+    (sent by the user).  Uses the macOS Spotlight index, which is
+    orders of magnitude faster than AppleScript for large mailboxes.
     """
-    # AppleScript date literals: «date "Monday, January 6, 2025 12:00:00 AM"»
-    # Easier to compare epoch-style, but AppleScript's date coercion from a
-    # plain string is locale-dependent.  We'll pass the dates as ISO strings
-    # and let AppleScript parse them via `date`.
-    start_str = start_date.strftime("%B %e, %Y %I:%M:%S %p").replace("  ", " ")
-    end_str = end_date.strftime("%B %e, %Y %I:%M:%S %p").replace("  ", " ")
+    seen_keys: set[tuple[str, str, str]] = set()
+    results: list[dict] = []
 
-    # Build an AppleScript list literal of the target email addresses.
-    email_list_items = ", ".join(f'"{e.lower()}"' for e in contact_emails)
+    start_iso = start_date.strftime("%Y-%m-%d")
+    end_iso = end_date.strftime("%Y-%m-%d")
 
-    field_sep = _FIELD_SEP
-    record_sep = _RECORD_SEP
-
-    # The script collects matching messages across *all* accounts and
-    # mailboxes, then writes one record per message.
-    script = textwrap.dedent(f"""\
-        on extractEmail(addr)
-            if addr contains "<" then
-                set AppleScript's text item delimiters to "<"
-                set afterBracket to text item 2 of addr
-                set AppleScript's text item delimiters to ">"
-                set emailOnly to text item 1 of afterBracket
-                set AppleScript's text item delimiters to ""
-                return emailOnly
-            end if
-            return addr
-        end extractEmail
-
-        set fieldSep to "{field_sep}"
-        set recordSep to "{record_sep}"
-        set targetEmails to {{{email_list_items}}}
-        set startDate to date "{start_str}"
-        set endDate to date "{end_str}"
-        set output to ""
-        set seenKeys to {{}}
-
-        tell application "Mail"
-            set boxesToSearch to {{}}
-            set allAccounts to every account
-            repeat with acct in allAccounts
-                set acctAddr to ""
-                try
-                    set acctAddr to email addresses of acct as text
-                end try
-                if acctAddr contains "garrett@anglinlaw.net" then
-                    try
-                        set end of boxesToSearch to mailbox "Inbox" of acct
-                    end try
-                    try
-                        set end of boxesToSearch to mailbox "Sent Items" of acct
-                    end try
-                end if
-            end repeat
-
-            repeat with mb in boxesToSearch
-                repeat with targetEmail in targetEmails
-                    -- Search by sender containing the target email (uses Mail index)
-                    set msgs to {{}}
-                    try
-                        set msgs to (every message of mb whose sender contains targetEmail)
-                    end try
-                    repeat with msg in msgs
-                        try
-                            set msgDate to date received of msg
-                            if msgDate is greater than or equal to startDate and msgDate is less than or equal to endDate then
-                                set senderAddr to sender of msg
-                                set senderEmail to my extractEmail(senderAddr)
-                                set msgSubject to ""
-                                try
-                                    set msgSubject to subject of msg
-                                end try
-
-                                -- De-duplicate
-                                set msgKey to senderEmail & msgSubject
-                                if msgKey is not in seenKeys then
-                                    set end of seenKeys to msgKey
-
-                                    set msgBody to ""
-                                    set recipAddrs to ""
-                                    try
-                                        set msgBody to content of msg
-                                    end try
-                                    try
-                                        set toRecips to every to recipient of msg
-                                        repeat with r in toRecips
-                                            if recipAddrs is not "" then set recipAddrs to recipAddrs & "; "
-                                            set recipAddrs to recipAddrs & address of r
-                                        end repeat
-                                    end try
-                                    try
-                                        set ccRecips to every cc recipient of msg
-                                        repeat with r in ccRecips
-                                            if recipAddrs is not "" then set recipAddrs to recipAddrs & "; "
-                                            set recipAddrs to recipAddrs & address of r
-                                        end repeat
-                                    end try
-
-                                    set dateStr to (year of msgDate as text) & "-"
-                                    set m to (month of msgDate as integer)
-                                    if m < 10 then set dateStr to dateStr & "0"
-                                    set dateStr to dateStr & (m as text) & "-"
-                                    set d to (day of msgDate as integer)
-                                    if d < 10 then set dateStr to dateStr & "0"
-                                    set dateStr to dateStr & (d as text)
-
-                                    set wordCount to count of words of msgBody
-
-                                    set rec to dateStr & fieldSep & senderEmail & fieldSep & recipAddrs & fieldSep & msgSubject & fieldSep & (wordCount as text)
-                                    if output is not "" then set output to output & recordSep
-                                    set output to output & rec
-                                end if
-                            end if
-                        end try
-                    end repeat
-
-                    -- Also search where target email is a recipient (sent emails)
-                    set msgs2 to {{}}
-                    try
-                        set msgs2 to (every message of mb whose sender contains "garrett@anglinlaw.net")
-                    end try
-                    repeat with msg in msgs2
-                        try
-                            set msgDate to date received of msg
-                            if msgDate is greater than or equal to startDate and msgDate is less than or equal to endDate then
-                                -- Check if target email is in recipients
-                                set foundRecip to false
-                                try
-                                    set toRecips to every to recipient of msg
-                                    repeat with r in toRecips
-                                        if address of r contains targetEmail then
-                                            set foundRecip to true
-                                            exit repeat
-                                        end if
-                                    end repeat
-                                end try
-                                if not foundRecip then
-                                    try
-                                        set ccRecips to every cc recipient of msg
-                                        repeat with r in ccRecips
-                                            if address of r contains targetEmail then
-                                                set foundRecip to true
-                                                exit repeat
-                                            end if
-                                        end repeat
-                                    end try
-                                end if
-
-                                if foundRecip then
-                                    set senderAddr to sender of msg
-                                    set senderEmail to my extractEmail(senderAddr)
-                                    set msgSubject to ""
-                                    try
-                                        set msgSubject to subject of msg
-                                    end try
-
-                                    set msgKey to senderEmail & msgSubject
-                                    if msgKey is not in seenKeys then
-                                        set end of seenKeys to msgKey
-
-                                        set msgBody to ""
-                                        set recipAddrs to ""
-                                        try
-                                            set msgBody to content of msg
-                                        end try
-                                        try
-                                            set toRecips to every to recipient of msg
-                                            repeat with r in toRecips
-                                                if recipAddrs is not "" then set recipAddrs to recipAddrs & "; "
-                                                set recipAddrs to recipAddrs & address of r
-                                            end repeat
-                                        end try
-                                        try
-                                            set ccRecips to every cc recipient of msg
-                                            repeat with r in ccRecips
-                                                if recipAddrs is not "" then set recipAddrs to recipAddrs & "; "
-                                                set recipAddrs to recipAddrs & address of r
-                                            end repeat
-                                        end try
-
-                                        set dateStr to (year of msgDate as text) & "-"
-                                        set m to (month of msgDate as integer)
-                                        if m < 10 then set dateStr to dateStr & "0"
-                                        set dateStr to dateStr & (m as text) & "-"
-                                        set d to (day of msgDate as integer)
-                                        if d < 10 then set dateStr to dateStr & "0"
-                                        set dateStr to dateStr & (d as text)
-
-                                        set wordCount to count of words of msgBody
-
-                                        set rec to dateStr & fieldSep & senderEmail & fieldSep & recipAddrs & fieldSep & msgSubject & fieldSep & (wordCount as text)
-                                        if output is not "" then set output to output & recordSep
-                                        set output to output & rec
-                                    end if
-                                end if
-                            end if
-                        end try
-                    end repeat
-                end repeat
-            end repeat
-        end tell
-
-        return output
-    """)
-    return script
-
-
-# ---------------------------------------------------------------------------
-# Run AppleScript and parse output
-# ---------------------------------------------------------------------------
-
-
-def _run_applescript(script: str) -> str:
-    """Execute an AppleScript via ``osascript`` and return stdout."""
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"AppleScript failed (exit {result.returncode}):\n{result.stderr.strip()}"
+    for contact in contact_emails:
+        # Search for emails FROM this contact within date range
+        query_from = (
+            f'kMDItemAuthors == "{contact}"cd'
+            f' && kMDItemContentCreationDate >= $time.iso({start_iso})'
+            f' && kMDItemContentCreationDate <= $time.iso({end_iso}T23:59:59)'
         )
-    return result.stdout.strip()
-
-
-def _parse_applescript_output(raw: str) -> list[dict]:
-    """Parse the delimited output from the AppleScript into row dicts."""
-    if not raw:
-        return []
-
-    rows: list[dict] = []
-    for record in raw.split(_RECORD_SEP):
-        record = record.strip()
-        if not record:
-            continue
-        parts = record.split(_FIELD_SEP)
-        if len(parts) < 5:
-            continue
-        date_str, sender, recipients, subject, word_count_str = (
-            parts[0],
-            parts[1],
-            parts[2],
-            parts[3],
-            parts[4],
+        # Search for emails TO this contact within date range
+        query_to = (
+            f'kMDItemRecipients == "{contact}"cd'
+            f' && kMDItemContentCreationDate >= $time.iso({start_iso})'
+            f' && kMDItemContentCreationDate <= $time.iso({end_iso}T23:59:59)'
         )
-        try:
-            word_count = int(word_count_str)
-        except ValueError:
-            word_count = 0
 
-        rows.append({
-            "date": date_str,
-            "sender": sender.strip(),
-            "recipients": recipients.strip(),
-            "subject": subject.strip(),
-            "word_count": word_count,
-        })
-    return rows
+        for query in [query_from, query_to]:
+            paths = _mdfind(query)
+            for path in paths:
+                parsed = _parse_emlx(path)
+                if parsed is None:
+                    continue
+
+                # Date range check (belt and suspenders)
+                msg_dt = parsed["datetime"]
+                if msg_dt.replace(tzinfo=None) < start_date:
+                    continue
+                if msg_dt.replace(tzinfo=None) > end_date:
+                    continue
+
+                # De-duplicate
+                key = (parsed["date"], parsed["sender"].lower(), parsed["subject"].lower())
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+
+                results.append({
+                    "date": parsed["date"],
+                    "sender": parsed["sender"],
+                    "recipients": parsed["recipients"],
+                    "subject": parsed["subject"],
+                    "word_count": parsed["word_count"],
+                })
+
+    return results
 
 
 # ---------------------------------------------------------------------------
-# Matching and DataFrame construction
+# Matching
 # ---------------------------------------------------------------------------
 
 
@@ -355,11 +246,7 @@ def _match_email_to_matter(
 
 
 def _identify_contact(row: dict, matter: Matter) -> str:
-    """Pick the best contact name to use in the activity description.
-
-    Returns the first address from (sender ∪ recipients) that belongs to
-    the matter's contact list, falling back to the sender address.
-    """
+    """Pick the best contact name to use in the activity description."""
     sender = row["sender"]
     all_addresses = [sender] + [
         r.strip() for r in row["recipients"].split(";") if r.strip()
@@ -389,6 +276,9 @@ def read_emails(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Query Apple Mail and return matched and unmatched email DataFrames.
 
+    Uses Spotlight (mdfind) to search the local Mail index, then parses
+    .emlx files with Python's email module.
+
     Parameters
     ----------
     start_date, end_date:
@@ -406,7 +296,7 @@ def read_emails(
     """
     matters = matters or load_matters()
 
-    # Collect every contact email across all matters for the AppleScript query.
+    # Collect every contact email across all matters.
     all_contact_emails: list[str] = []
     for m in matters:
         all_contact_emails.extend(m.contact_emails)
@@ -419,24 +309,12 @@ def read_emails(
         )
         return empty_matched, empty_unmatched
 
-    script = _build_applescript(start_date, end_date, all_contact_emails)
-    raw_output = _run_applescript(script)
-    raw_rows = _parse_applescript_output(raw_output)
-
-    # De-duplicate by (date, sender, subject) — the same message can appear
-    # in multiple mailboxes (Inbox + All Mail, etc.).
-    seen: set[tuple[str, str, str]] = set()
-    unique_rows: list[dict] = []
-    for r in raw_rows:
-        key = (r["date"], r["sender"].lower(), r["subject"].lower())
-        if key not in seen:
-            seen.add(key)
-            unique_rows.append(r)
+    raw_rows = _search_spotlight(start_date, end_date, all_contact_emails)
 
     matched_rows: list[dict] = []
     unmatched_rows: list[dict] = []
 
-    for row in unique_rows:
+    for row in raw_rows:
         est_hours = estimate_email_time(row["word_count"])
         result = _match_email_to_matter(row, matters)
 
