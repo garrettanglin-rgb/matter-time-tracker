@@ -99,10 +99,10 @@ def _build_applescript(
                 end try
                 if acctAddr contains "garrett@anglinlaw.net" then
                     try
-                        set end of boxesToSearch to inbox of acct
+                        set end of boxesToSearch to mailbox "Inbox" of acct
                     end try
                     try
-                        set end of boxesToSearch to sent mailbox of acct
+                        set end of boxesToSearch to mailbox "Sent Items" of acct
                     end try
                 end if
             end repeat
