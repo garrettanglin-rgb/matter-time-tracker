@@ -74,10 +74,24 @@ def _build_applescript(
     # The script collects matching messages across *all* accounts and
     # mailboxes, then writes one record per message.
     script = textwrap.dedent(f"""\
+        on extractEmail(addr)
+            -- Extract email from "Name <email>" format; return as-is if no angle brackets
+            if addr contains "<" then
+                set AppleScript's text item delimiters to "<"
+                set afterBracket to text item 2 of addr
+                set AppleScript's text item delimiters to ">"
+                set emailOnly to text item 1 of afterBracket
+                set AppleScript's text item delimiters to ""
+                return emailOnly
+            end if
+            return addr
+        end extractEmail
+
         on isEmailInList(addr, emailList)
-            set lowerAddr to do shell script "echo " & quoted form of addr & " | tr '[:upper:]' '[:lower:]'"
+            -- AppleScript string comparison is case-insensitive by default
+            set cleanAddr to my extractEmail(addr)
             repeat with e in emailList
-                if lowerAddr is equal to (contents of e) then return true
+                if cleanAddr is equal to (contents of e) then return true
             end repeat
             return false
         end isEmailInList
@@ -154,6 +168,7 @@ def _build_applescript(
                             set msgSubject to ""
                             set msgBody to ""
                             set recipAddrs to ""
+                            set senderEmail to my extractEmail(senderAddr)
                             try
                                 set msgSubject to subject of msg
                             end try
@@ -185,7 +200,7 @@ def _build_applescript(
 
                             set wordCount to count of words of msgBody
 
-                            set rec to dateStr & fieldSep & senderAddr & fieldSep & recipAddrs & fieldSep & msgSubject & fieldSep & (wordCount as text)
+                            set rec to dateStr & fieldSep & senderEmail & fieldSep & recipAddrs & fieldSep & msgSubject & fieldSep & (wordCount as text)
                             if output is not "" then set output to output & recordSep
                             set output to output & rec
                         end if
